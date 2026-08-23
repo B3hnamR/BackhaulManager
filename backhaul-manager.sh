@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  Backhaul Free - Tunnel Manager
-#  Version : 1.1.0
+#  Version : 1.3.0
 #  Author  : @B3hnamR
 #  Supports: TCP | TCPMUX | WSMUX | WSSMUX
 #  Roles   : Iran (Server) | Kharej (Client)
@@ -32,6 +32,12 @@ BINARY="/usr/local/bin/backhaul"
 CERT_DIR="$INSTALL_DIR/certs"
 SERVICE_DIR="/etc/systemd/system"
 BACKUP_DIR="$INSTALL_DIR/backups"
+METRICS_DIR="$INSTALL_DIR/metrics"
+HEALTH_DIR="$INSTALL_DIR/health"
+PAIR_DIR="$INSTALL_DIR/pairs"
+NOTIFY_FILE="$INSTALL_DIR/telegram-notify.conf"
+MANAGER_RUNTIME="$INSTALL_DIR/backhaul-manager-runtime.sh"
+SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 die()        { echo -e "${FAIL} ${LRED}$*${NC}" >&2; exit 1; }
@@ -95,7 +101,87 @@ port_in_use() {
 
 is_valid_port() {
     local port="$1"
-    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
+    [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 ))
+}
+
+is_tunnel_service_name() {
+    local svc="$1"
+    [[ "$svc" =~ ^backhaul-(iran|kharej)-(tcp|tcpmux|wsmux|wssmux)-([0-9]+)\.service$ ]] \
+        && is_valid_port "${BASH_REMATCH[3]}"
+}
+
+is_valid_restart_interval_hours() {
+    local hours="$1"
+    # Keep the systemd unit simple and prevent an accidental, excessively long timer.
+    [[ "$hours" =~ ^[1-9][0-9]{0,3}$ ]] && (( 10#$hours >= 1 && 10#$hours <= 8760 ))
+}
+
+is_positive_integer() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+is_valid_boolean() {
+    [[ "$1" == "true" || "$1" == "false" ]]
+}
+
+is_valid_log_level() {
+    case "$1" in
+        panic|fatal|error|warn|info|debug|trace) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_valid_web_port() {
+    [[ "$1" == "0" ]] || is_valid_port "$1"
+}
+
+_validate_positive_tuning_value() {
+    local name="$1" value="$2"
+    if ! is_positive_integer "$value"; then
+        warn "${name} must be a positive whole number."
+        return 1
+    fi
+}
+
+validate_tuning_parameters() {
+    local role="$1" transport="$2" invalid=0
+
+    _validate_positive_tuning_value "keepalive_period" "$ADV_KEEPALIVE" || invalid=1
+    is_valid_boolean "$ADV_NODELAY" || { warn "nodelay must be true or false."; invalid=1; }
+    is_valid_boolean "$ADV_SNIFFER" || { warn "sniffer must be true or false."; invalid=1; }
+    is_valid_log_level "$ADV_LOG_LEVEL" || { warn "Invalid log_level."; invalid=1; }
+    is_valid_web_port "$ADV_WEB_PORT" || { warn "web_port must be 0 or a valid port."; invalid=1; }
+
+    if [[ "$transport" == "tcp" || "$transport" == "tcpmux" ]]; then
+        _validate_positive_tuning_value "mss" "$ADV_MSS" || invalid=1
+        _validate_positive_tuning_value "so_rcvbuf" "$ADV_SO_RCVBUF" || invalid=1
+        _validate_positive_tuning_value "so_sndbuf" "$ADV_SO_SNDBUF" || invalid=1
+    fi
+
+    if [[ "$role" == "iran" ]]; then
+        _validate_positive_tuning_value "heartbeat" "$ADV_HEARTBEAT" || invalid=1
+        _validate_positive_tuning_value "channel_size" "$ADV_CHANNEL_SIZE" || invalid=1
+        if [[ "$transport" != "tcp" ]]; then
+            _validate_positive_tuning_value "mux_con" "$ADV_MUX_CON" || invalid=1
+            _validate_positive_tuning_value "mux_version" "$ADV_MUX_VERSION" || invalid=1
+            _validate_positive_tuning_value "mux_framesize" "$ADV_MUX_FRAMESIZE" || invalid=1
+            _validate_positive_tuning_value "mux_recievebuffer" "$ADV_MUX_RECVBUF" || invalid=1
+            _validate_positive_tuning_value "mux_streambuffer" "$ADV_MUX_STREAMBUF" || invalid=1
+        fi
+    else
+        _validate_positive_tuning_value "connection_pool" "$ADV_CONN_POOL" || invalid=1
+        is_valid_boolean "$ADV_AGGRESSIVE_POOL" || { warn "aggressive_pool must be true or false."; invalid=1; }
+        _validate_positive_tuning_value "dial_timeout" "$ADV_DIAL_TIMEOUT" || invalid=1
+        _validate_positive_tuning_value "retry_interval" "$ADV_RETRY_INTERVAL" || invalid=1
+        if [[ "$transport" != "tcp" ]]; then
+            _validate_positive_tuning_value "mux_version" "$ADV_MUX_VERSION" || invalid=1
+            _validate_positive_tuning_value "mux_framesize" "$ADV_MUX_FRAMESIZE" || invalid=1
+            _validate_positive_tuning_value "mux_recievebuffer" "$ADV_MUX_RECVBUF" || invalid=1
+            _validate_positive_tuning_value "mux_streambuffer" "$ADV_MUX_STREAMBUF" || invalid=1
+        fi
+    fi
+
+    return "$invalid"
 }
 
 toml_escape() {
@@ -140,6 +226,1009 @@ backup_config() {
     cp "$file" "$BACKUP_DIR/$(basename "$file").bak.$ts"
 }
 
+# ─── TUNNEL HEALTH, METRICS & WATCHDOG ──────────────────────────────────────
+tunnel_base_name() {
+    printf '%s' "${1%.service}"
+}
+
+get_tunnel_role() {
+    local svc="$1"
+    [[ "$svc" =~ ^backhaul-(iran|kharej)- ]] && printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+get_toml_value() {
+    local config_file="$1" key="$2"
+    [[ -f "$config_file" ]] || return 1
+
+    local value
+    value=$(awk -F= -v key="$key" '
+        $1 ~ "^[[:space:]]*" key "[[:space:]]*$" {
+            value=$2
+            sub(/^[[:space:]]*/, "", value)
+            sub(/[[:space:]]*#.*/, "", value)
+            sub(/[[:space:]]*$/, "", value)
+            print value
+            exit
+        }
+    ' "$config_file")
+    [[ -n "$value" ]] || return 1
+    if [[ "$value" =~ ^\"(.*)\"$ ]]; then
+        value="${BASH_REMATCH[1]}"
+    fi
+    printf '%s\n' "$value"
+}
+
+get_tunnel_port() {
+    local svc="$1" config_file address port
+    config_file=$(get_service_config_path "$svc" || true)
+    [[ -n "$config_file" ]] || return 1
+    address=$(get_toml_value "$config_file" "bind_addr" 2>/dev/null \
+        || get_toml_value "$config_file" "remote_addr" 2>/dev/null || true)
+    [[ -n "$address" ]] || return 1
+    port="${address##*:}"
+    is_valid_port "$port" || return 1
+    printf '%s\n' "$port"
+}
+
+get_tunnel_connection_stats() {
+    local port="$1"
+    is_valid_port "$port" || { printf '0 0 0\n'; return 1; }
+
+    ss -Htn state established 2>/dev/null | awk -v port="$port" '
+        $0 ~ (":" port " ") || $0 ~ (":" port "$") {
+            count++
+            if (($2 + 0) > recvq) recvq=$2 + 0
+            if (($3 + 0) > sendq) sendq=$3 + 0
+        }
+        END { printf "%d %d %d\n", count + 0, recvq + 0, sendq + 0 }
+    '
+}
+
+get_service_restart_count() {
+    local value
+    value=$(systemctl show -p NRestarts --value "$1" 2>/dev/null || true)
+    [[ "$value" =~ ^[0-9]+$ ]] || value=0
+    printf '%s\n' "$value"
+}
+
+get_tunnel_snapshot() {
+    local svc="$1"
+    is_tunnel_service_name "$svc" || return 1
+
+    local active="inactive" pid=0 cpu="0" rss_kb=0 restarts=0 port="?"
+    local connections=0 recvq=0 sendq=0 stats
+    systemctl is-active --quiet "$svc" 2>/dev/null && active="active"
+    pid=$(systemctl show -p MainPID --value "$svc" 2>/dev/null || echo 0)
+    [[ "$pid" =~ ^[0-9]+$ ]] || pid=0
+    if [[ "$pid" != "0" ]] && [[ -d "/proc/$pid" ]]; then
+        cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ' || echo 0)
+        rss_kb=$(ps -p "$pid" -o rss= 2>/dev/null | tr -d ' ' || echo 0)
+    fi
+    restarts=$(get_service_restart_count "$svc")
+    port=$(get_tunnel_port "$svc" 2>/dev/null || echo "?")
+    if is_valid_port "$port"; then
+        stats=$(get_tunnel_connection_stats "$port")
+        read -r connections recvq sendq <<< "${stats:-0 0 0}"
+    fi
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$svc" "$active" "$pid" "$cpu" \
+        "$rss_kb" "$restarts" "$connections" "$recvq" "$sendq"
+}
+
+metrics_file_path() {
+    local svc="$1"
+    printf '%s/%s.csv' "$METRICS_DIR" "$(tunnel_base_name "$svc")"
+}
+
+rotate_metrics_file() {
+    local metrics_file="$1" line_count temp_file
+    [[ -f "$metrics_file" ]] || return 0
+    line_count=$(wc -l < "$metrics_file" 2>/dev/null || echo 0)
+    [[ "$line_count" =~ ^[0-9]+$ ]] && (( line_count > 10001 )) || return 0
+    temp_file=$(mktemp "${metrics_file}.XXXXXX") || return 1
+    { head -n 1 "$metrics_file"; tail -n 10000 "$metrics_file"; } > "$temp_file"
+    mv "$temp_file" "$metrics_file"
+}
+
+collect_tunnel_metrics() {
+    local svc="$1"
+    is_tunnel_service_name "$svc" || return 1
+    mkdir -p "$METRICS_DIR"
+    local metrics_file; metrics_file=$(metrics_file_path "$svc")
+    if [[ ! -f "$metrics_file" ]]; then
+        echo "timestamp,service,active,pid,cpu_percent,rss_kb,restarts,connections,max_recvq,max_sendq" > "$metrics_file"
+        chmod 600 "$metrics_file"
+    fi
+    get_tunnel_snapshot "$svc" >> "$metrics_file"
+    rotate_metrics_file "$metrics_file"
+}
+
+show_tunnel_metrics() {
+    local svc="$1" snapshot metrics_file
+    snapshot=$(get_tunnel_snapshot "$svc" || true)
+    if [[ -z "$snapshot" ]]; then
+        warn "Could not collect health data for $svc"
+        return 1
+    fi
+    local ts _svc active pid cpu rss restarts connections recvq sendq
+    IFS=',' read -r ts _svc active pid cpu rss restarts connections recvq sendq <<< "$snapshot"
+    section "Tunnel Health & Metrics"
+    echo -e "  ${BULLET} Service      : ${CYAN}${svc}${NC}"
+    echo -e "  ${BULLET} State        : ${LYELLOW}${active}${NC}  PID: ${WHITE}${pid}${NC}  Restarts: ${WHITE}${restarts}${NC}"
+    echo -e "  ${BULLET} Process      : CPU ${LYELLOW}${cpu}%${NC}  RSS ${LYELLOW}$(( rss / 1024 ))MiB${NC}"
+    echo -e "  ${BULLET} Connections  : ${LYELLOW}${connections}${NC}  Max queue: recv ${LYELLOW}${recvq}${NC} / send ${LYELLOW}${sendq}${NC} bytes"
+    metrics_file=$(metrics_file_path "$svc")
+    if [[ -f "$metrics_file" ]]; then
+        echo -e "\n  ${BOLD}${WHITE}Latest recorded samples:${NC}"
+        tail -n 6 "$metrics_file" | column -s, -t 2>/dev/null || tail -n 6 "$metrics_file"
+    else
+        echo -e "  ${DIM}No history yet. Enable metrics collection to record samples.${NC}"
+    fi
+}
+
+metrics_job_service_name() { printf '%s-metrics.service' "$(tunnel_base_name "$1")"; }
+metrics_timer_name() { printf '%s-metrics.timer' "$(tunnel_base_name "$1")"; }
+watchdog_job_service_name() { printf '%s-watchdog.service' "$(tunnel_base_name "$1")"; }
+watchdog_timer_name() { printf '%s-watchdog.timer' "$(tunnel_base_name "$1")"; }
+
+install_manager_runtime() {
+    mkdir -p "$INSTALL_DIR"
+    [[ -f "$SCRIPT_PATH" ]] || { warn "Manager script not found: $SCRIPT_PATH"; return 1; }
+    [[ "$SCRIPT_PATH" == "$MANAGER_RUNTIME" ]] || cp "$SCRIPT_PATH" "$MANAGER_RUNTIME" || return 1
+    chmod 700 "$MANAGER_RUNTIME"
+}
+
+is_valid_interval_minutes() {
+    [[ "$1" =~ ^[1-9][0-9]?$ ]] && (( 10#$1 <= 60 ))
+}
+
+is_valid_watchdog_threshold() {
+    [[ "$1" =~ ^[1-9][0-9]?$ ]] && (( 10#$1 <= 60 ))
+}
+
+is_valid_queue_threshold() {
+    [[ "$1" == "0" ]] || { [[ "$1" =~ ^[1-9][0-9]{0,9}$ ]] && (( 10#$1 <= 2147483647 )); }
+}
+
+get_timer_interval_minutes() {
+    local timer="$1" timer_file="$SERVICE_DIR/$timer" interval
+    [[ -f "$timer_file" ]] || return 1
+    interval=$(awk -F= '/^OnUnitActiveSec=/{print $2; exit}' "$timer_file")
+    [[ "$interval" =~ ^[1-9][0-9]*min$ ]] || return 1
+    printf '%s\n' "${interval%min}"
+}
+
+enable_metrics_collection() {
+    local svc="$1" minutes="$2"
+    if ! is_tunnel_service_name "$svc" || ! is_valid_interval_minutes "$minutes"; then
+        warn "Invalid tunnel service or metrics interval."
+        return 1
+    fi
+    install_manager_runtime || return 1
+    local job_service timer
+    job_service=$(metrics_job_service_name "$svc")
+    timer=$(metrics_timer_name "$svc")
+    cat > "$SERVICE_DIR/$job_service" << SERVICE
+[Unit]
+Description=Collect Backhaul health metrics for ${svc}
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/env bash ${MANAGER_RUNTIME} --collect-metrics ${svc}
+SERVICE
+    cat > "$SERVICE_DIR/$timer" << TIMER
+[Unit]
+Description=Collect Backhaul metrics for ${svc} every ${minutes} minute(s)
+
+[Timer]
+OnActiveSec=${minutes}min
+OnUnitActiveSec=${minutes}min
+AccuracySec=30s
+Unit=${job_service}
+
+[Install]
+WantedBy=timers.target
+TIMER
+    systemctl daemon-reload
+    if systemctl enable "$timer" 2>/dev/null && systemctl restart "$timer" 2>/dev/null; then
+        collect_tunnel_metrics "$svc" || true
+        success "Metrics collection enabled: every ${minutes} minute(s)."
+        return 0
+    fi
+    warn "Could not enable metrics timer: $timer"
+    return 1
+}
+
+disable_metrics_collection() {
+    local svc="$1" timer
+    timer=$(metrics_timer_name "$svc")
+    systemctl disable --now "$timer" 2>/dev/null || true
+    success "Metrics collection disabled for: $svc"
+}
+
+delete_metrics_collection() {
+    local svc="$1" job_service timer
+    job_service=$(metrics_job_service_name "$svc")
+    timer=$(metrics_timer_name "$svc")
+    systemctl disable --now "$timer" 2>/dev/null || true
+    rm -f "$SERVICE_DIR/$timer" "$SERVICE_DIR/$job_service" "$(metrics_file_path "$svc")"
+    systemctl daemon-reload
+    success "Metrics collection deleted for: $svc"
+}
+
+watchdog_config_path() { printf '%s/%s.conf' "$HEALTH_DIR" "$(tunnel_base_name "$1")"; }
+watchdog_state_path() { printf '%s/%s.state' "$HEALTH_DIR" "$(tunnel_base_name "$1")"; }
+
+watchdog_config_value() {
+    local svc="$1" key="$2" default_value="$3" config_file value
+    config_file=$(watchdog_config_path "$svc")
+    [[ -f "$config_file" ]] || { printf '%s\n' "$default_value"; return; }
+    value=$(awk -F= -v key="$key" '$1 == key {print $2; exit}' "$config_file")
+    printf '%s\n' "${value:-$default_value}"
+}
+
+write_watchdog_config() {
+    local svc="$1" mode="$2" threshold="$3" queue_threshold="$4" notifications="$5"
+    mkdir -p "$HEALTH_DIR"
+    cat > "$(watchdog_config_path "$svc")" << CONFIG
+mode=${mode}
+failure_threshold=${threshold}
+queue_threshold=${queue_threshold}
+notifications=${notifications}
+CONFIG
+    chmod 600 "$(watchdog_config_path "$svc")"
+}
+
+read_watchdog_failures() {
+    local state_file; state_file=$(watchdog_state_path "$1")
+    [[ -f "$state_file" ]] || { echo 0; return; }
+    local failures; failures=$(awk -F= '$1 == "failures" {print $2; exit}' "$state_file")
+    [[ "$failures" =~ ^[0-9]+$ ]] || failures=0
+    printf '%s\n' "$failures"
+}
+
+write_watchdog_state() {
+    local svc="$1" failures="$2" reason="$3"
+    mkdir -p "$HEALTH_DIR"
+    cat > "$(watchdog_state_path "$svc")" << STATE
+failures=${failures}
+reason=${reason}
+updated=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+STATE
+    chmod 600 "$(watchdog_state_path "$svc")"
+}
+
+telegram_notify() {
+    local message="$1"
+    [[ -f "$NOTIFY_FILE" ]] || return 0
+    command -v curl >/dev/null 2>&1 || return 0
+    local token chat_id enabled
+    token=$(awk -F= '$1 == "token" {print $2; exit}' "$NOTIFY_FILE")
+    chat_id=$(awk -F= '$1 == "chat_id" {print $2; exit}' "$NOTIFY_FILE")
+    enabled=$(awk -F= '$1 == "enabled" {print $2; exit}' "$NOTIFY_FILE")
+    [[ "$enabled" == "true" && -n "$token" && -n "$chat_id" ]] || return 0
+    curl --silent --show-error --max-time 12 --output /dev/null \
+        --data-urlencode "chat_id=${chat_id}" \
+        --data-urlencode "text=${message}" \
+        "https://api.telegram.org/bot${token}/sendMessage" 2>/dev/null || true
+}
+
+run_tunnel_watchdog() {
+    local svc="$1"
+    is_tunnel_service_name "$svc" || return 2
+    local mode threshold queue_threshold notifications failures port stats connections recvq sendq reason="" healthy=1
+    mode=$(watchdog_config_value "$svc" mode "$( [[ "$(get_tunnel_role "$svc")" == "kharej" ]] && echo peer || echo service )")
+    threshold=$(watchdog_config_value "$svc" failure_threshold 3)
+    queue_threshold=$(watchdog_config_value "$svc" queue_threshold 0)
+    notifications=$(watchdog_config_value "$svc" notifications false)
+    [[ "$mode" == "service" || "$mode" == "peer" ]] || mode=service
+    is_valid_watchdog_threshold "$threshold" || threshold=3
+    is_valid_queue_threshold "$queue_threshold" || queue_threshold=0
+
+    if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+        healthy=0; reason="service-inactive"
+    else
+        port=$(get_tunnel_port "$svc" 2>/dev/null || true)
+        if is_valid_port "$port"; then
+            stats=$(get_tunnel_connection_stats "$port")
+            read -r connections recvq sendq <<< "${stats:-0 0 0}"
+        else
+            connections=0; recvq=0; sendq=0
+        fi
+        if [[ "$mode" == "peer" && "$connections" -eq 0 ]]; then
+            healthy=0; reason="no-established-tunnel-connection"
+        elif [[ "$queue_threshold" -gt 0 ]] && { [[ "$recvq" -ge "$queue_threshold" ]] || [[ "$sendq" -ge "$queue_threshold" ]]; }; then
+            healthy=0; reason="tcp-queue-threshold-exceeded"
+        fi
+    fi
+
+    failures=$(read_watchdog_failures "$svc")
+    if [[ "$healthy" -eq 1 ]]; then
+        if [[ "$failures" -gt 0 && "$notifications" == "true" ]]; then
+            telegram_notify "Backhaul recovered: ${svc}"
+        fi
+        write_watchdog_state "$svc" 0 "healthy"
+        return 0
+    fi
+
+    failures=$(( failures + 1 ))
+    write_watchdog_state "$svc" "$failures" "$reason"
+    collect_tunnel_metrics "$svc" >/dev/null 2>&1 || true
+    if [[ "$failures" -eq 1 && "$notifications" == "true" ]]; then
+        telegram_notify "Backhaul watchdog warning: ${svc} (${reason})"
+    fi
+    if [[ "$failures" -ge "$threshold" ]]; then
+        if systemctl restart "$svc" 2>/dev/null; then
+            write_watchdog_state "$svc" 0 "restart-requested:${reason}"
+            [[ "$notifications" == "true" ]] && telegram_notify "Backhaul watchdog restarted: ${svc} (${reason})"
+        else
+            [[ "$notifications" == "true" ]] && telegram_notify "Backhaul watchdog failed to restart: ${svc} (${reason})"
+        fi
+    fi
+    return 0
+}
+
+enable_tunnel_watchdog() {
+    local svc="$1" minutes="$2" mode="$3" threshold="$4" queue_threshold="$5" notifications="$6"
+    if ! is_tunnel_service_name "$svc" || ! is_valid_interval_minutes "$minutes" \
+        || [[ "$mode" != "service" && "$mode" != "peer" ]] \
+        || ! is_valid_watchdog_threshold "$threshold" \
+        || ! is_valid_queue_threshold "$queue_threshold" \
+        || ! is_valid_boolean "$notifications"; then
+        warn "Invalid watchdog settings."
+        return 1
+    fi
+    install_manager_runtime || return 1
+    write_watchdog_config "$svc" "$mode" "$threshold" "$queue_threshold" "$notifications"
+    local job_service timer
+    job_service=$(watchdog_job_service_name "$svc")
+    timer=$(watchdog_timer_name "$svc")
+    cat > "$SERVICE_DIR/$job_service" << SERVICE
+[Unit]
+Description=Backhaul health watchdog for ${svc}
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/env bash ${MANAGER_RUNTIME} --watchdog ${svc}
+SERVICE
+    cat > "$SERVICE_DIR/$timer" << TIMER
+[Unit]
+Description=Check Backhaul health for ${svc} every ${minutes} minute(s)
+
+[Timer]
+OnActiveSec=${minutes}min
+OnUnitActiveSec=${minutes}min
+AccuracySec=20s
+Unit=${job_service}
+
+[Install]
+WantedBy=timers.target
+TIMER
+    systemctl daemon-reload
+    if systemctl enable "$timer" 2>/dev/null && systemctl restart "$timer" 2>/dev/null; then
+        success "Health watchdog enabled: every ${minutes} minute(s), threshold ${threshold}."
+        return 0
+    fi
+    warn "Could not enable health watchdog: $timer"
+    return 1
+}
+
+disable_tunnel_watchdog() {
+    local svc="$1" timer
+    timer=$(watchdog_timer_name "$svc")
+    systemctl disable --now "$timer" 2>/dev/null || true
+    success "Health watchdog disabled for: $svc (settings retained)"
+}
+
+delete_tunnel_watchdog() {
+    local svc="$1" job_service timer
+    job_service=$(watchdog_job_service_name "$svc")
+    timer=$(watchdog_timer_name "$svc")
+    systemctl disable --now "$timer" 2>/dev/null || true
+    rm -f "$SERVICE_DIR/$timer" "$SERVICE_DIR/$job_service" \
+        "$(watchdog_config_path "$svc")" "$(watchdog_state_path "$svc")"
+    systemctl daemon-reload
+    success "Health watchdog deleted for: $svc"
+}
+
+safe_restart_tunnel() {
+    local svc="$1" timeout="${2:-25}" role port waited=0 stats connections=0 recvq=0 sendq=0
+    is_tunnel_service_name "$svc" || return 1
+    role=$(get_tunnel_role "$svc")
+    port=$(get_tunnel_port "$svc" 2>/dev/null || true)
+    info "Restarting $svc and waiting up to ${timeout}s for health..."
+    systemctl restart "$svc" 2>/dev/null || { warn "Failed to restart $svc"; return 1; }
+    while (( waited < timeout )); do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            if [[ "$role" == "iran" ]]; then
+                if is_valid_port "$port" && ss -ltn 2>/dev/null | grep -q ":${port} "; then
+                    success "Server is listening again: $svc"
+                    return 0
+                fi
+            else
+                stats=$(get_tunnel_connection_stats "$port")
+                read -r connections recvq sendq <<< "${stats:-0 0 0}"
+                if [[ "$connections" -gt 0 ]]; then
+                    success "Client reconnected: $svc (${connections} connection(s))"
+                    return 0
+                fi
+            fi
+        fi
+        sleep 1
+        waited=$(( waited + 1 ))
+    done
+    warn "Restart completed, but health could not be confirmed within ${timeout}s. Check logs."
+    return 1
+}
+
+# ─── PAIR MANIFESTS & TELEGRAM NOTIFICATIONS ────────────────────────────────
+sha256_text() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$1" | sha256sum | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        printf '%s' "$1" | openssl dgst -sha256 -r | awk '{print $1}'
+    else
+        return 1
+    fi
+}
+
+get_tunnel_token_hash() {
+    local svc="$1" config_file token
+    config_file=$(get_service_config_path "$svc" || true)
+    [[ -n "$config_file" ]] || return 1
+    token=$(awk -F'"' '/^[[:space:]]*token[[:space:]]*=/{print $2; exit}' "$config_file")
+    [[ -n "$token" ]] || return 1
+    sha256_text "$token"
+}
+
+is_valid_host_or_domain() {
+    [[ "$1" =~ ^[A-Za-z0-9._:-]+$ ]]
+}
+
+get_manifest_value() {
+    local manifest="$1" key="$2"
+    awk -F= -v key="$key" '$1 == key {print substr($0, index($0, "=") + 1); exit}' "$manifest"
+}
+
+get_remote_host() {
+    local remote_addr="$1" host
+    host="${remote_addr%:*}"
+    host="${host#[}"
+    host="${host%]}"
+    printf '%s\n' "$host"
+}
+
+pair_compare_value() {
+    local label="$1" expected="$2" actual="$3"
+    if [[ "$expected" == "$actual" ]]; then
+        echo -e "  ${OK} ${label}: ${LGREEN}match${NC}"
+        return 0
+    fi
+    echo -e "  ${WARN} ${label}: ${LRED}mismatch${NC} ${DIM}(Iran: ${expected:-missing} | Kharej: ${actual:-missing})${NC}"
+    return 1
+}
+
+menu_export_pair_manifest() {
+    section "Export Iran Pair Manifest"
+    local svc=""
+    pick_tunnel svc "Select IRAN tunnel to export"
+    [[ -n "$svc" ]] || return
+    if [[ "$(get_tunnel_role "$svc")" != "iran" ]]; then
+        warn "Pair manifests must be exported from the IRAN server tunnel."
+        press_enter; return
+    fi
+
+    local cfg transport port token_hash default_endpoint endpoint manifest
+    cfg=$(get_service_config_path "$svc" || true)
+    transport=$(get_toml_value "$cfg" transport 2>/dev/null || true)
+    port=$(get_tunnel_port "$svc" 2>/dev/null || true)
+    token_hash=$(get_tunnel_token_hash "$svc" 2>/dev/null || true)
+    [[ -n "$transport" && -n "$port" && -n "$token_hash" ]] || { warn "Could not read tunnel configuration."; press_enter; return; }
+
+    default_endpoint=$(get_local_ip)
+    prompt "Public Iran IP/domain used by the client [${default_endpoint}]:"; read -r endpoint
+    endpoint="${endpoint:-$default_endpoint}"
+    if ! is_valid_host_or_domain "$endpoint"; then
+        warn "Invalid IP address or domain name."
+        press_enter; return
+    fi
+
+    mkdir -p "$PAIR_DIR"
+    manifest="$PAIR_DIR/$(tunnel_base_name "$svc").pair"
+    cat > "$manifest" << MANIFEST
+format=1
+role=iran
+endpoint=${endpoint}
+port=${port}
+transport=${transport}
+token_sha256=${token_hash}
+keepalive_period=$(get_toml_value "$cfg" keepalive_period 2>/dev/null || true)
+nodelay=$(get_toml_value "$cfg" nodelay 2>/dev/null || true)
+mux_version=$(get_toml_value "$cfg" mux_version 2>/dev/null || true)
+mux_framesize=$(get_toml_value "$cfg" mux_framesize 2>/dev/null || true)
+mux_recievebuffer=$(get_toml_value "$cfg" mux_recievebuffer 2>/dev/null || true)
+mux_streambuffer=$(get_toml_value "$cfg" mux_streambuffer 2>/dev/null || true)
+created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+MANIFEST
+    chmod 600 "$manifest"
+    success "Pair manifest created: $manifest"
+    echo -e "  ${DIM}It contains no token; transfer it to the Kharej server and run Pair Check there.${NC}"
+    press_enter
+}
+
+menu_verify_pair_manifest() {
+    section "Verify Kharej Tunnel Against Pair Manifest"
+    prompt "Full path to Iran pair manifest:"; read -r manifest
+    [[ -f "$manifest" ]] || { warn "Manifest not found."; press_enter; return; }
+    if [[ "$(get_manifest_value "$manifest" format)" != "1" || "$(get_manifest_value "$manifest" role)" != "iran" ]]; then
+        warn "Invalid Iran pair manifest."
+        press_enter; return
+    fi
+
+    local svc=""
+    pick_tunnel svc "Select KHAREJ tunnel to verify"
+    [[ -n "$svc" ]] || return
+    if [[ "$(get_tunnel_role "$svc")" != "kharej" ]]; then
+        warn "Select a KHAREJ tunnel for pair verification."
+        press_enter; return
+    fi
+
+    local cfg remote_addr remote_host local_transport local_port local_hash mismatches=0 key
+    cfg=$(get_service_config_path "$svc" || true)
+    remote_addr=$(get_toml_value "$cfg" remote_addr 2>/dev/null || true)
+    remote_host=$(get_remote_host "$remote_addr")
+    local_transport=$(get_toml_value "$cfg" transport 2>/dev/null || true)
+    local_port=$(get_tunnel_port "$svc" 2>/dev/null || true)
+    local_hash=$(get_tunnel_token_hash "$svc" 2>/dev/null || true)
+
+    echo -e "\n  ${BOLD}${WHITE}Pair check results:${NC}"
+    pair_compare_value "Endpoint" "$(get_manifest_value "$manifest" endpoint)" "$remote_host" || mismatches=1
+    pair_compare_value "Tunnel port" "$(get_manifest_value "$manifest" port)" "$local_port" || mismatches=1
+    pair_compare_value "Transport" "$(get_manifest_value "$manifest" transport)" "$local_transport" || mismatches=1
+    pair_compare_value "Token fingerprint" "$(get_manifest_value "$manifest" token_sha256)" "$local_hash" || mismatches=1
+    for key in keepalive_period nodelay mux_version mux_framesize mux_recievebuffer mux_streambuffer; do
+        local expected actual
+        expected=$(get_manifest_value "$manifest" "$key")
+        actual=$(get_toml_value "$cfg" "$key" 2>/dev/null || true)
+        [[ -z "$expected" && -z "$actual" ]] || pair_compare_value "$key" "$expected" "$actual" || mismatches=1
+    done
+    [[ "$mismatches" -eq 0 ]] && success "Pair verification passed." || warn "Pair verification found mismatches."
+    press_enter
+}
+
+menu_pair_tools() {
+    section "Pair Tools"
+    echo -e "  ${WHITE}[1]${NC} Export IRAN pair manifest ${DIM}(no token included)${NC}"
+    echo -e "  ${WHITE}[2]${NC} Verify KHAREJ tunnel against manifest"
+    echo -e "  ${WHITE}[0]${NC} Back"
+    separator
+    prompt "Choice:"; read -r pair_choice
+    case "$pair_choice" in
+        1) menu_export_pair_manifest ;;
+        2) menu_verify_pair_manifest ;;
+        0) return ;;
+        *) warn "Invalid choice"; press_enter ;;
+    esac
+}
+
+is_valid_telegram_token() {
+    [[ "$1" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]
+}
+
+is_valid_telegram_chat_id() {
+    [[ "$1" =~ ^-?[0-9]+$ || "$1" =~ ^@[A-Za-z0-9_]+$ ]]
+}
+
+menu_notification_settings() {
+    section "Telegram Notifications"
+    local enabled="false"
+    [[ -f "$NOTIFY_FILE" ]] && enabled=$(awk -F= '$1 == "enabled" {print $2; exit}' "$NOTIFY_FILE")
+    echo -e "  ${BULLET} Status: $([[ "$enabled" == "true" ]] && echo -e "${LGREEN}Enabled${NC}" || echo -e "${GRAY}Disabled${NC}")"
+    echo -e "  ${WHITE}[1]${NC} Configure / update Telegram"
+    echo -e "  ${WHITE}[2]${NC} Send test notification"
+    echo -e "  ${WHITE}[3]${NC} Disable notifications ${DIM}(keep settings)${NC}"
+    echo -e "  ${WHITE}[4]${NC} Delete notification settings"
+    echo -e "  ${WHITE}[0]${NC} Back"
+    separator
+    prompt "Choice:"; read -r notify_choice
+    case "$notify_choice" in
+        1)
+            local token chat_id
+            if ! command -v curl >/dev/null 2>&1; then
+                warn "Telegram notifications require curl. Install curl and try again."
+                press_enter; return
+            fi
+            prompt "Telegram bot token:"; read -r token
+            prompt "Chat ID or @channel:"; read -r chat_id
+            if ! is_valid_telegram_token "$token" || ! is_valid_telegram_chat_id "$chat_id"; then
+                warn "Invalid Telegram token or chat ID."
+            else
+                mkdir -p "$INSTALL_DIR"
+                cat > "$NOTIFY_FILE" << CONFIG
+enabled=true
+token=${token}
+chat_id=${chat_id}
+CONFIG
+                chmod 600 "$NOTIFY_FILE"
+                success "Telegram notifications configured."
+            fi
+            ;;
+        2)
+            if [[ "$enabled" == "true" ]]; then
+                telegram_notify "Backhaul Manager test notification from $(hostname)"
+                success "Test notification requested."
+            else
+                warn "Configure and enable Telegram notifications first."
+            fi
+            ;;
+        3)
+            if [[ -f "$NOTIFY_FILE" ]]; then
+                sed -i 's/^enabled=.*/enabled=false/' "$NOTIFY_FILE"
+                success "Telegram notifications disabled."
+            else
+                info "No Telegram settings found."
+            fi
+            ;;
+        4)
+            if [[ -f "$NOTIFY_FILE" ]]; then
+                prompt "Type 'yes' to delete notification settings:"; read -r confirm_notify
+                if [[ "$confirm_notify" == "yes" ]]; then
+                    rm -f "$NOTIFY_FILE"
+                    success "Notification settings deleted."
+                else
+                    info "Cancelled."
+                fi
+            else
+                info "No Telegram settings found."
+            fi
+            ;;
+        0) return ;;
+        *) warn "Invalid choice" ;;
+    esac
+    press_enter
+}
+
+metrics_collection_status() {
+    local svc="$1" timer minutes
+    timer=$(metrics_timer_name "$svc")
+    minutes=$(get_timer_interval_minutes "$timer" 2>/dev/null || true)
+    if [[ -n "$minutes" ]] && systemctl is-enabled --quiet "$timer" 2>/dev/null; then
+        echo -e "${LGREEN}Every ${minutes} min${NC}"
+    elif [[ -f "$SERVICE_DIR/$timer" ]]; then
+        echo -e "${YELLOW}Disabled${NC} ${DIM}(was every ${minutes:-?} min)${NC}"
+    else
+        echo -e "${GRAY}Disabled${NC}"
+    fi
+}
+
+watchdog_status() {
+    local svc="$1" timer mode threshold
+    timer=$(watchdog_timer_name "$svc")
+    mode=$(watchdog_config_value "$svc" mode "service")
+    threshold=$(watchdog_config_value "$svc" failure_threshold "3")
+    if [[ -f "$SERVICE_DIR/$timer" ]] && systemctl is-enabled --quiet "$timer" 2>/dev/null; then
+        echo -e "${LGREEN}Enabled${NC} ${DIM}(${mode}, threshold ${threshold})${NC}"
+    elif [[ -f "$SERVICE_DIR/$timer" ]]; then
+        echo -e "${YELLOW}Disabled${NC} ${DIM}(${mode}, threshold ${threshold})${NC}"
+    else
+        echo -e "${GRAY}Disabled${NC}"
+    fi
+}
+
+menu_metrics_collection() {
+    local svc="$1" timer current_minutes
+    timer=$(metrics_timer_name "$svc")
+    current_minutes=$(get_timer_interval_minutes "$timer" 2>/dev/null || true)
+    section "Metrics Collection"
+    echo -e "  ${BULLET} Status: $(metrics_collection_status "$svc")"
+    echo -e "  ${WHITE}[1]${NC} Enable / change interval"
+    echo -e "  ${WHITE}[2]${NC} Collect one sample now"
+    echo -e "  ${WHITE}[3]${NC} Disable collection ${DIM}(keep history)${NC}"
+    echo -e "  ${WHITE}[4]${NC} Delete collection and history"
+    echo -e "  ${WHITE}[0]${NC} Back"
+    separator
+    prompt "Choice:"; read -r metrics_choice
+    case "$metrics_choice" in
+        1)
+            local minutes="${current_minutes:-5}"
+            prompt "Collect every how many minutes [1-60, ${minutes}]:"; read -r input_minutes
+            minutes="${input_minutes:-$minutes}"
+            if is_valid_interval_minutes "$minutes"; then
+                enable_metrics_collection "$svc" "$minutes"
+            else
+                warn "Enter a whole number between 1 and 60."
+            fi
+            ;;
+        2)
+            collect_tunnel_metrics "$svc" && success "Metrics sample recorded." || warn "Could not record metrics."
+            ;;
+        3)
+            [[ -f "$SERVICE_DIR/$timer" ]] && disable_metrics_collection "$svc" || info "Metrics collection is not configured."
+            ;;
+        4)
+            prompt "Type 'yes' to delete metrics history:"; read -r confirm_metrics
+            if [[ "$confirm_metrics" == "yes" ]]; then
+                delete_metrics_collection "$svc"
+            else
+                info "Cancelled."
+            fi
+            ;;
+        0) return ;;
+        *) warn "Invalid choice" ;;
+    esac
+    press_enter
+}
+
+menu_watchdog() {
+    local svc="$1" timer current_minutes default_mode default_threshold default_queue default_notify
+    timer=$(watchdog_timer_name "$svc")
+    current_minutes=$(get_timer_interval_minutes "$timer" 2>/dev/null || true)
+    default_mode=$(watchdog_config_value "$svc" mode "$( [[ "$(get_tunnel_role "$svc")" == "kharej" ]] && echo peer || echo service )")
+    default_threshold=$(watchdog_config_value "$svc" failure_threshold "3")
+    default_queue=$(watchdog_config_value "$svc" queue_threshold "0")
+    default_notify=$(watchdog_config_value "$svc" notifications "false")
+    section "Health Watchdog"
+    echo -e "  ${BULLET} Status: $(watchdog_status "$svc")"
+    echo -e "  ${DIM}Peer mode checks for established tunnel connections. Server mode only checks service health.${NC}"
+    echo -e "  ${WHITE}[1]${NC} Enable / change watchdog"
+    echo -e "  ${WHITE}[2]${NC} Run one health check now"
+    echo -e "  ${WHITE}[3]${NC} Disable watchdog ${DIM}(keep settings)${NC}"
+    echo -e "  ${WHITE}[4]${NC} Delete watchdog settings"
+    echo -e "  ${WHITE}[0]${NC} Back"
+    separator
+    prompt "Choice:"; read -r watchdog_choice
+    case "$watchdog_choice" in
+        1)
+            local minutes="${current_minutes:-2}" mode threshold queue_threshold notify
+            prompt "Check every how many minutes [1-60, ${minutes}]:"; read -r input_minutes
+            minutes="${input_minutes:-$minutes}"
+            echo -e "  ${WHITE}[1]${NC} Service mode ${DIM}(restart only if service is inactive)${NC}"
+            echo -e "  ${WHITE}[2]${NC} Peer mode    ${DIM}(also requires tunnel connections)${NC}"
+            prompt "Health mode [1/2, ${default_mode}]:"; read -r mode_choice
+            case "${mode_choice:-$default_mode}" in
+                1|service) mode="service" ;;
+                2|peer) mode="peer" ;;
+                *) warn "Invalid health mode."; press_enter; return ;;
+            esac
+            prompt "Consecutive failures before restart [${default_threshold}]:"; read -r threshold
+            threshold="${threshold:-$default_threshold}"
+            prompt "Maximum TCP queue bytes (0=disable) [${default_queue}]:"; read -r queue_threshold
+            queue_threshold="${queue_threshold:-$default_queue}"
+            prompt "Send Telegram alerts? (true/false) [${default_notify}]:"; read -r notify
+            notify="${notify:-$default_notify}"; notify="${notify,,}"
+            if is_valid_interval_minutes "$minutes" && is_valid_watchdog_threshold "$threshold" \
+                && is_valid_queue_threshold "$queue_threshold" && is_valid_boolean "$notify"; then
+                enable_tunnel_watchdog "$svc" "$minutes" "$mode" "$threshold" "$queue_threshold" "$notify"
+            else
+                warn "Invalid watchdog values."
+            fi
+            ;;
+        2)
+            run_tunnel_watchdog "$svc"
+            echo -e "  ${BULLET} Failures: ${LYELLOW}$(read_watchdog_failures "$svc")${NC}"
+            ;;
+        3)
+            [[ -f "$SERVICE_DIR/$timer" ]] && disable_tunnel_watchdog "$svc" || info "Watchdog is not configured."
+            ;;
+        4)
+            prompt "Type 'yes' to delete watchdog settings:"; read -r confirm_watchdog
+            if [[ "$confirm_watchdog" == "yes" ]]; then
+                delete_tunnel_watchdog "$svc"
+            else
+                info "Cancelled."
+            fi
+            ;;
+        0) return ;;
+        *) warn "Invalid choice" ;;
+    esac
+    press_enter
+}
+
+menu_health_tools() {
+    local svc="$1" role
+    role=$(get_tunnel_role "$svc")
+    while true; do
+        section "Health & Recovery"
+        echo -e "  ${BULLET} Metrics:  $(metrics_collection_status "$svc")"
+        echo -e "  ${BULLET} Watchdog: $(watchdog_status "$svc")"
+        if [[ "$role" == "iran" ]]; then
+            echo -e "  ${DIM}For paired recovery, restart the KHAREJ client first; avoid restarting both sides together.${NC}"
+        fi
+        echo -e "  ${WHITE}[1]${NC} View current health and history"
+        echo -e "  ${WHITE}[2]${NC} Metrics collection settings"
+        echo -e "  ${WHITE}[3]${NC} Health watchdog settings"
+        echo -e "  ${WHITE}[4]${NC} Restart + health check ${DIM}(safe local restart)${NC}"
+        echo -e "  ${WHITE}[0]${NC} Back"
+        separator
+        prompt "Choice:"; read -r health_choice
+        case "$health_choice" in
+            1) show_tunnel_metrics "$svc"; press_enter ;;
+            2) menu_metrics_collection "$svc" ;;
+            3) menu_watchdog "$svc" ;;
+            4) safe_restart_tunnel "$svc"; press_enter ;;
+            0) return ;;
+            *) warn "Invalid choice"; sleep 1 ;;
+        esac
+    done
+}
+
+delete_tunnel_health_artifacts() {
+    local svc="$1"
+    delete_metrics_collection "$svc" >/dev/null
+    delete_tunnel_watchdog "$svc" >/dev/null
+}
+
+# ─── SCHEDULED TUNNEL RESTARTS ──────────────────────────────────────────────
+# A timer/service pair is used instead of cron so schedules survive reboots and
+# remain visible through the normal systemctl tooling.
+restart_job_service_name() {
+    printf '%s-restart.service' "${1%.service}"
+}
+
+restart_timer_name() {
+    printf '%s-restart.timer' "${1%.service}"
+}
+
+get_scheduled_restart_hours() {
+    local svc="$1"
+    local timer; timer=$(restart_timer_name "$svc")
+    local timer_file="$SERVICE_DIR/$timer"
+    [[ -f "$timer_file" ]] || return 1
+
+    local interval
+    interval=$(awk -F= '/^OnUnitActiveSec=/{print $2; exit}' "$timer_file")
+    [[ "$interval" =~ ^[1-9][0-9]*h$ ]] || return 1
+    printf '%s\n' "${interval%h}"
+}
+
+scheduled_restart_status() {
+    local svc="$1"
+    local timer hours
+    timer=$(restart_timer_name "$svc")
+    hours=$(get_scheduled_restart_hours "$svc" 2>/dev/null || true)
+
+    if [[ -n "$hours" ]] && systemctl is-enabled --quiet "$timer" 2>/dev/null; then
+        echo -e "${LGREEN}Every ${hours}h${NC}"
+    elif [[ -f "$SERVICE_DIR/$timer" ]]; then
+        echo -e "${YELLOW}Disabled${NC} ${DIM}(was every ${hours:-?}h)${NC}"
+    else
+        echo -e "${GRAY}Disabled${NC}"
+    fi
+}
+
+enable_scheduled_restart() {
+    local svc="$1" hours="$2"
+    if ! is_tunnel_service_name "$svc" || ! is_valid_restart_interval_hours "$hours"; then
+        warn "Invalid tunnel service or restart interval."
+        return 1
+    fi
+
+    local job_service timer
+    job_service=$(restart_job_service_name "$svc")
+    timer=$(restart_timer_name "$svc")
+
+    cat > "$SERVICE_DIR/$job_service" << SERVICE
+[Unit]
+Description=Scheduled restart for ${svc}
+
+[Service]
+Type=oneshot
+# try-restart preserves a tunnel that an operator intentionally stopped.
+ExecStart=/usr/bin/systemctl try-restart ${svc}
+SERVICE
+
+    cat > "$SERVICE_DIR/$timer" << TIMER
+[Unit]
+Description=Restart ${svc} every ${hours} hour(s)
+
+[Timer]
+OnActiveSec=${hours}h
+OnUnitActiveSec=${hours}h
+AccuracySec=1min
+Unit=${job_service}
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+    systemctl daemon-reload
+    # Restarting the timer re-arms it immediately when its interval is changed.
+    if systemctl enable "$timer" 2>/dev/null && systemctl restart "$timer" 2>/dev/null; then
+        success "Automatic restart enabled: $svc every ${hours} hour(s)."
+        return 0
+    fi
+
+    warn "Timer files were created, but $timer could not be enabled."
+    return 1
+}
+
+disable_scheduled_restart() {
+    local svc="$1"
+    if ! is_tunnel_service_name "$svc"; then
+        warn "Invalid tunnel service."
+        return 1
+    fi
+
+    local job_service timer
+    job_service=$(restart_job_service_name "$svc")
+    timer=$(restart_timer_name "$svc")
+
+    systemctl disable --now "$timer" 2>/dev/null || true
+    success "Automatic restart disabled for: $svc (setting retained)"
+}
+
+delete_scheduled_restart() {
+    local svc="$1"
+    if ! is_tunnel_service_name "$svc"; then
+        warn "Invalid tunnel service."
+        return 1
+    fi
+
+    local job_service timer
+    job_service=$(restart_job_service_name "$svc")
+    timer=$(restart_timer_name "$svc")
+
+    systemctl disable --now "$timer" 2>/dev/null || true
+    rm -f "$SERVICE_DIR/$timer" "$SERVICE_DIR/$job_service"
+    systemctl daemon-reload
+    success "Automatic restart deleted for: $svc"
+}
+
+menu_scheduled_restart() {
+    local svc="$1"
+    local current_hours
+    current_hours=$(get_scheduled_restart_hours "$svc" 2>/dev/null || true)
+
+    section "Scheduled Restart"
+    echo -e "  ${BULLET} Tunnel : ${CYAN}${svc}${NC}"
+    echo -e "  ${BULLET} Status : $(scheduled_restart_status "$svc")"
+    echo -e "  ${DIM}A restart briefly interrupts active connections. The timer only restarts a running tunnel.${NC}"
+    echo ""
+    echo -e "  ${WHITE}[1]${NC} Enable / change interval"
+    echo -e "  ${WHITE}[2]${NC} Disable scheduled restart ${DIM}(keep setting)${NC}"
+    echo -e "  ${WHITE}[3]${NC} Delete scheduled restart ${DIM}(remove setting)${NC}"
+    echo -e "  ${WHITE}[0]${NC} Back"
+    separator
+    prompt "Choice:"; read -r schedule_choice
+
+    case "$schedule_choice" in
+        1)
+            local default_hours="${current_hours:-6}"
+            prompt "Restart every how many hours [1-8760, ${default_hours}]:"; read -r hours
+            hours="${hours:-$default_hours}"
+            if ! is_valid_restart_interval_hours "$hours"; then
+                warn "Enter a whole number between 1 and 8760."
+            else
+                enable_scheduled_restart "$svc" "$hours"
+            fi
+            ;;
+        2)
+            if [[ -f "$SERVICE_DIR/$(restart_timer_name "$svc")" ]]; then
+                disable_scheduled_restart "$svc"
+            else
+                info "No scheduled restart is configured for this tunnel."
+            fi
+            ;;
+        3)
+            if [[ -f "$SERVICE_DIR/$(restart_timer_name "$svc")" ]]; then
+                prompt "Type 'yes' to delete the scheduled restart:"; read -r confirm_delete
+                if [[ "$confirm_delete" == "yes" ]]; then
+                    delete_scheduled_restart "$svc"
+                else
+                    info "Cancelled."
+                fi
+            else
+                info "No scheduled restart is configured for this tunnel."
+            fi
+            ;;
+        0) return ;;
+        *) warn "Invalid choice" ;;
+    esac
+    press_enter
+}
+
 generate_ssl_cert() {
     mkdir -p "$CERT_DIR"
     if [[ ! -f "$CERT_DIR/wssmux.crt" ]] || [[ ! -f "$CERT_DIR/wssmux.key" ]]; then
@@ -170,7 +1259,7 @@ LOGO
 ask_server_role() {
     clear
     _print_logo
-    echo -e "  ${DIM}Backhaul Free Tunnel Manager v1.1.0 by ${NC}${CYAN}@B3hnamR${NC}"
+    echo -e "  ${DIM}Backhaul Free Tunnel Manager v1.3.0 by ${NC}${CYAN}@B3hnamR${NC}"
     echo -e "  ${DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
     # Try auto-detect first
@@ -220,7 +1309,7 @@ print_header() {
     esac
 
     _print_logo
-    echo -e "  ${DIM}Backhaul Free Tunnel Manager v1.1.0 by ${NC}${CYAN}@B3hnamR${NC}"
+    echo -e "  ${DIM}Backhaul Free Tunnel Manager v1.3.0 by ${NC}${CYAN}@B3hnamR${NC}"
     echo -e "  ${DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "  ${GRAY}IP   : ${WHITE}$ip${NC}   ${GRAY}Role : ${role_color}${BOLD}$role_label${NC}"
     [[ -x "$BINARY" ]] && {
@@ -336,9 +1425,9 @@ show_status() {
     section "Tunnel Status Overview"
     local found=0
 
-    # Get all backhaul services
-    mapfile -t services < <(systemctl list-unit-files --type=service 2>/dev/null \
-        | grep -o 'backhaul[^ ]*\.service' | sort -u)
+    # Only real tunnel units belong here; scheduled-restart helper units do not.
+    local services=()
+    list_tunnels services
 
     if [[ ${#services[@]} -eq 0 ]]; then
         warn "No Backhaul services found."
@@ -482,6 +1571,7 @@ _ask_advanced_iran() {
 
     prompt "nodelay [${PRESET_IRAN_NODELAY}]:"; read -r v
     ADV_NODELAY="${v:-$PRESET_IRAN_NODELAY}"
+    ADV_NODELAY="${ADV_NODELAY,,}"
 
     prompt "heartbeat [${PRESET_IRAN_HEARTBEAT}]:"; read -r v
     ADV_HEARTBEAT="${v:-$PRESET_IRAN_HEARTBEAT}"
@@ -516,18 +1606,26 @@ _ask_advanced_iran() {
     echo -e "  ${DIM}log_level options: panic | fatal | error | warn | info | debug | trace${NC}"
     prompt "log_level [${_def_ll_iran}]:"; read -r v
     ADV_LOG_LEVEL="${v:-$_def_ll_iran}"
+    ADV_LOG_LEVEL="${ADV_LOG_LEVEL,,}"
 
-    prompt "mss [${PRESET_IRAN_MSS}]:"; read -r v
-    ADV_MSS="${v:-$PRESET_IRAN_MSS}"
+    if [[ "$transport" == "tcp" || "$transport" == "tcpmux" ]]; then
+        prompt "mss [${PRESET_IRAN_MSS}]:"; read -r v
+        ADV_MSS="${v:-$PRESET_IRAN_MSS}"
 
-    prompt "so_rcvbuf [${PRESET_IRAN_SO_RCVBUF}]:"; read -r v
-    ADV_SO_RCVBUF="${v:-$PRESET_IRAN_SO_RCVBUF}"
+        prompt "so_rcvbuf [${PRESET_IRAN_SO_RCVBUF}]:"; read -r v
+        ADV_SO_RCVBUF="${v:-$PRESET_IRAN_SO_RCVBUF}"
 
-    prompt "so_sndbuf [${PRESET_IRAN_SO_SNDBUF}]:"; read -r v
-    ADV_SO_SNDBUF="${v:-$PRESET_IRAN_SO_SNDBUF}"
+        prompt "so_sndbuf [${PRESET_IRAN_SO_SNDBUF}]:"; read -r v
+        ADV_SO_SNDBUF="${v:-$PRESET_IRAN_SO_SNDBUF}"
+    else
+        ADV_MSS="$PRESET_IRAN_MSS"
+        ADV_SO_RCVBUF="$PRESET_IRAN_SO_RCVBUF"
+        ADV_SO_SNDBUF="$PRESET_IRAN_SO_SNDBUF"
+    fi
 
     prompt "sniffer (true/false) [${PRESET_IRAN_SNIFFER}]:"; read -r v
     ADV_SNIFFER="${v:-$PRESET_IRAN_SNIFFER}"
+    ADV_SNIFFER="${ADV_SNIFFER,,}"
 
     prompt "web_port (0=disable) [${PRESET_IRAN_WEB_PORT}]:"; read -r v
     ADV_WEB_PORT="${v:-$PRESET_IRAN_WEB_PORT}"
@@ -541,6 +1639,7 @@ _ask_advanced_kharej() {
 
     prompt "aggressive_pool (true/false) [${PRESET_KHAREJ_AGGRESSIVE_POOL}]:"; read -r v
     ADV_AGGRESSIVE_POOL="${v:-$PRESET_KHAREJ_AGGRESSIVE_POOL}"
+    ADV_AGGRESSIVE_POOL="${ADV_AGGRESSIVE_POOL,,}"
 
     prompt "keepalive_period [${PRESET_KHAREJ_KEEPALIVE}]:"; read -r v
     ADV_KEEPALIVE="${v:-$PRESET_KHAREJ_KEEPALIVE}"
@@ -553,6 +1652,7 @@ _ask_advanced_kharej() {
 
     prompt "nodelay (true/false) [${PRESET_KHAREJ_NODELAY}]:"; read -r v
     ADV_NODELAY="${v:-$PRESET_KHAREJ_NODELAY}"
+    ADV_NODELAY="${ADV_NODELAY,,}"
 
     if [[ "$transport" != "tcp" ]]; then
         prompt "mux_version [${PRESET_KHAREJ_MUX_VERSION}]:"; read -r v
@@ -577,18 +1677,26 @@ _ask_advanced_kharej() {
     echo -e "  ${DIM}log_level options: panic | fatal | error | warn | info | debug | trace${NC}"
     prompt "log_level [${_def_ll_kharej}]:"; read -r v
     ADV_LOG_LEVEL="${v:-$_def_ll_kharej}"
+    ADV_LOG_LEVEL="${ADV_LOG_LEVEL,,}"
 
-    prompt "mss [${PRESET_KHAREJ_MSS}]:"; read -r v
-    ADV_MSS="${v:-$PRESET_KHAREJ_MSS}"
+    if [[ "$transport" == "tcp" || "$transport" == "tcpmux" ]]; then
+        prompt "mss [${PRESET_KHAREJ_MSS}]:"; read -r v
+        ADV_MSS="${v:-$PRESET_KHAREJ_MSS}"
 
-    prompt "so_rcvbuf [${PRESET_KHAREJ_SO_RCVBUF}]:"; read -r v
-    ADV_SO_RCVBUF="${v:-$PRESET_KHAREJ_SO_RCVBUF}"
+        prompt "so_rcvbuf [${PRESET_KHAREJ_SO_RCVBUF}]:"; read -r v
+        ADV_SO_RCVBUF="${v:-$PRESET_KHAREJ_SO_RCVBUF}"
 
-    prompt "so_sndbuf [${PRESET_KHAREJ_SO_SNDBUF}]:"; read -r v
-    ADV_SO_SNDBUF="${v:-$PRESET_KHAREJ_SO_SNDBUF}"
+        prompt "so_sndbuf [${PRESET_KHAREJ_SO_SNDBUF}]:"; read -r v
+        ADV_SO_SNDBUF="${v:-$PRESET_KHAREJ_SO_SNDBUF}"
+    else
+        ADV_MSS="$PRESET_KHAREJ_MSS"
+        ADV_SO_RCVBUF="$PRESET_KHAREJ_SO_RCVBUF"
+        ADV_SO_SNDBUF="$PRESET_KHAREJ_SO_SNDBUF"
+    fi
 
     prompt "sniffer (true/false) [${PRESET_KHAREJ_SNIFFER}]:"; read -r v
     ADV_SNIFFER="${v:-$PRESET_KHAREJ_SNIFFER}"
+    ADV_SNIFFER="${ADV_SNIFFER,,}"
 
     prompt "web_port (0=disable) [${PRESET_KHAREJ_WEB_PORT}]:"; read -r v
     ADV_WEB_PORT="${v:-$PRESET_KHAREJ_WEB_PORT}"
@@ -701,6 +1809,7 @@ _write_kharej_config() {
 menu_create_tunnel() {
     section "Create New Tunnel"
     check_binary || return
+    mkdir -p "$INSTALL_DIR" "$BACKUP_DIR"
 
     # Use globally-set SERVER_ROLE (set at startup)
     local ROLE="$SERVER_ROLE"
@@ -897,6 +2006,11 @@ menu_create_tunnel() {
             ;;
     esac
 
+    if ! validate_tuning_parameters "$ROLE" "$TRANSPORT"; then
+        warn "Tunnel was not created. Correct the invalid advanced values and try again."
+        return
+    fi
+
     # ── Conflict check & write ────────────────────────────────────────────────
     local SVC_NAME="backhaul-${ROLE}-${TRANSPORT}-${TUNNEL_PORT}"
     local CONFIG_FILE="$INSTALL_DIR/${ROLE}-${TRANSPORT}-${TUNNEL_PORT}.toml"
@@ -1038,9 +2152,9 @@ list_tunnels() {
     local -n _result=$1
     _result=()
     while IFS= read -r svc; do
-        _result+=("$svc")
+        is_tunnel_service_name "$svc" && _result+=("$svc")
     done < <(systemctl list-unit-files --type=service 2>/dev/null \
-        | grep -o 'backhaul[^ ]*\.service' | sort -u)
+        | awk '{print $1}' | grep -E '^backhaul-.*\.service$' | sort -u)
 }
 
 pick_tunnel() {
@@ -1093,6 +2207,8 @@ menu_delete_tunnel() {
 
     systemctl stop "$sel_svc" 2>/dev/null || true
     systemctl disable "$sel_svc" 2>/dev/null || true
+    delete_scheduled_restart "$sel_svc" >/dev/null
+    delete_tunnel_health_artifacts "$sel_svc" >/dev/null
     rm -f "$SERVICE_DIR/$sel_svc"
     systemctl daemon-reload
 
@@ -1775,6 +2891,7 @@ menu_tunnel_manage() {
         separator
         echo -e "  Service : ${svc_status}   CPU: ${LYELLOW}${cpu}%${NC}   Mem: ${LYELLOW}${mem}${NC}   Uptime: ${DIM}${uptime_str}${NC}"
         echo -e "  Tunnel  : ${conn_status}"
+        echo -e "  Auto restart: $(scheduled_restart_status "$svc")"
         separator
         echo ""
         echo -e "  ${LGREEN}[1]${NC}  Start"
@@ -1782,7 +2899,9 @@ menu_tunnel_manage() {
         echo -e "  ${LCYAN}[3]${NC}  Restart"
         echo -e "  ${LBLUE}[4]${NC}  View Logs  ${DIM}(live)${NC}"
         echo -e "  ${MAGENTA}[5]${NC}  Edit Config"
-        echo -e "  ${RED}[6]${NC}  Delete Tunnel"
+        echo -e "  ${LCYAN}[6]${NC}  Health & Recovery"
+        echo -e "  ${MAGENTA}[7]${NC}  Scheduled Restart"
+        echo -e "  ${RED}[8]${NC}  Delete Tunnel"
         echo -e "  ${GRAY}[0]${NC}  Back"
         separator
         prompt "Choice:"; read -r sub_choice
@@ -1851,6 +2970,12 @@ menu_tunnel_manage() {
                 fi
                 ;;
             6)
+                menu_health_tools "$svc"
+                ;;
+            7)
+                menu_scheduled_restart "$svc"
+                ;;
+            8)
                 echo ""
                 echo -e "  ${LRED}${BOLD}WARNING: This will permanently delete:${NC}"
                 echo -e "  ${BULLET} Service : ${CYAN}$svc${NC}"
@@ -1860,6 +2985,8 @@ menu_tunnel_manage() {
                 if [[ "$confirm" == "yes" ]]; then
                     systemctl stop "$svc" 2>/dev/null || true
                     systemctl disable "$svc" 2>/dev/null || true
+                    delete_scheduled_restart "$svc" >/dev/null
+                    delete_tunnel_health_artifacts "$svc" >/dev/null
                     rm -f "$SERVICE_DIR/$svc"
                     systemctl daemon-reload
                     if [[ -n "$cfg" ]] && [[ -f "$cfg" ]]; then
@@ -1927,12 +3054,14 @@ main_menu() {
 
         echo -e "  ${LGREEN}[1]${NC}  Create New Tunnel"
         echo -e "  ${LCYAN}[2]${NC}  Manage Tunnels"
-        echo -e "            ${DIM}(start / stop / restart / logs / edit / delete)${NC}"
+        echo -e "            ${DIM}(health / watchdog / restart / logs / edit / schedule / delete)${NC}"
         echo -e "  ${MAGENTA}[3]${NC}  Backup & Restore Configs"
         echo -e "  ${MAGENTA}[4]${NC}  Firewall Helper"
         echo -e "  ${LCYAN}[5]${NC}  Two-Way Link Test"
         echo -e "  ${GRAY}[6]${NC}  System Info"
         echo -e "  ${GRAY}[7]${NC}  Install / Update Binary"
+        echo -e "  ${MAGENTA}[8]${NC}  Pair Tools"
+        echo -e "  ${MAGENTA}[9]${NC}  Telegram Notifications"
         echo -e "  ${RED}[0]${NC}  Exit"
         separator
         prompt "Choice:"; read -r main_choice
@@ -1945,6 +3074,8 @@ main_menu() {
             5) menu_link_test ;;
             6) menu_info ;;
             7) menu_install ;;
+            8) menu_pair_tools ;;
+            9) menu_notification_settings ;;
             0)
                 echo -e "\n${DIM}Bye!${NC}\n"
                 exit 0
@@ -1958,6 +3089,25 @@ main_menu() {
 }
 
 # ─── Entry Point ─────────────────────────────────────────────────────────────
-require_root
-ask_server_role
-main_menu
+# Keep functions sourceable for non-interactive validation without launching the UI.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "${1:-}" in
+        --watchdog)
+            [[ $# -eq 2 ]] || die "Usage: $0 --watchdog <service>"
+            require_root
+            run_tunnel_watchdog "$2"
+            exit $?
+            ;;
+        --collect-metrics)
+            [[ $# -eq 2 ]] || die "Usage: $0 --collect-metrics <service>"
+            require_root
+            collect_tunnel_metrics "$2"
+            exit $?
+            ;;
+        "") ;;
+        *) die "Unknown command: $1" ;;
+    esac
+    require_root
+    ask_server_role
+    main_menu
+fi
