@@ -2,6 +2,17 @@
 
 All notable changes to Backhaul Manager are documented in this file.
 
+## [1.3.1] - 2026-08-23
+
+### Fixed
+
+- **File-based installer compatibility** — Prevents an unbound `BASH_SOURCE` error when the manager is launched from standard input and provides a clear message when timer features need a script file.
+
+### Changed
+
+- **One-line installation command** — Downloads and installs the manager as `/root/backhaul-manager.sh` before launching it, so runtime timer features can safely copy the script.
+- **Deployment guidance** — Documents the recommended Kharej-only scheduled restart policy and Telegram configuration for Iran/Kharej monitoring.
+
 ## [1.3.0] - 2026-08-23
 
 ### Added
