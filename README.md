@@ -13,6 +13,10 @@ Join the Telegram channel for updates, notes, and more BackhaulManager content: 
 - Guided tunnel creation for `tcp`, `tcpmux`, `wsmux`, and `wssmux`
 - Preset and advanced tuning modes for production-style configs
 - Systemd service generation, start/stop/restart, live logs, and deletion
+- Per-tunnel scheduled restart (systemd timer; configure, disable, or delete it in **Manage Tunnels**)
+- Per-tunnel health metrics history, adaptive watchdog recovery, and safe restart with connection verification
+- Secure Iran/Kharej pair manifests that compare transport settings and a token fingerprint without exposing the token
+- Optional Telegram alerts for watchdog warnings, recovery, and restart events
 - Config backup/restore and firewall helper for UFW or iptables
 - Built-in two-way link test for ping and TCP reachability checks
 - WSSMUX TLS certificate generation with OpenSSL
@@ -43,12 +47,16 @@ For the best default experience, choose **WSSMUX** as the tunnel transport and u
 2. Create a tunnel and copy the generated transport, port, and token.
 3. Run the script on the Kharej server and choose `KHAREJ`.
 4. Create the matching tunnel using the Iran server address and the same token.
-5. Use **Manage Tunnels** to inspect status, follow logs, restart, edit, or delete services.
+5. Use **Manage Tunnels** to inspect status, follow logs, view health history, configure metrics/watchdog recovery, restart, edit, delete, or set a scheduled restart interval.
 
 ## Notes
 
 - Generated configs are stored in `/etc/backhaul`.
 - Services are created as `backhaul-<role>-<transport>-<port>.service`.
+- Scheduled restarts run through a paired systemd timer. They restart only an already-running tunnel, so a tunnel stopped manually remains stopped; a schedule can be disabled while retaining its interval or deleted completely.
+- **Health & Recovery** can collect a rolling local CSV history (up to 10,000 samples) and run an adaptive watchdog. Peer mode requires at least one established tunnel connection; service mode only checks whether Backhaul is active.
+- Pair manifests contain the endpoint, shared transport parameters, and a SHA-256 token fingerprint—never the token itself. Export on Iran and verify on Kharej.
+- Telegram alerts require `curl`, a bot token, and a chat ID or channel handle; they are sent only when both global Telegram settings and the tunnel watchdog's alert option are enabled.
 - Existing configs are backed up before overwrite/edit/delete operations.
 - For WSSMUX, the script can generate a self-signed TLS certificate automatically.
 
