@@ -4,7 +4,7 @@
 
 ![BackhaulManager showcase](assets/showcase.png)
 
-> Current manager version: **1.3.0** · See the [changelog](CHANGELOG.md) for release notes.
+> Current manager version: **1.3.1** · See the [changelog](CHANGELOG.md) for release notes.
 
 Join the Telegram channel for updates and BackhaulManager news: [@B3hnamR](https://t.me/B3hnamR)
 
@@ -16,7 +16,7 @@ Join the Telegram channel for updates and BackhaulManager news: [@B3hnamR](https
 | Supported transports | Creates `tcp`, `tcpmux`, `wsmux`, and `wssmux` Backhaul tunnels. |
 | Production presets | Provides preset and advanced tuning modes for connection pool, mux, keepalive, and transport settings. |
 | Service management | Generates systemd services and lets you start, stop, restart, inspect logs, edit, or delete tunnels. |
-| Scheduled restart | Enables, changes, disables, or removes a per-tunnel recurring restart schedule. |
+| Scheduled restart | Enables, changes, disables, or removes a per-tunnel recurring restart schedule; recommended for Kharej only. |
 | Health watchdog | Checks service state, optional peer connectivity, and TCP queue pressure; restarts a tunnel after configurable consecutive failures. |
 | Metrics history | Stores rolling per-tunnel CPU, memory, restart count, connection, and queue metrics in CSV files. |
 | Safe restart | Restarts the local tunnel and confirms that the listener or client connection has recovered. |
@@ -36,10 +36,10 @@ Join the Telegram channel for updates and BackhaulManager news: [@B3hnamR](https
 Run this one-line command on each server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/B3hnamR/BackhaulManager/master/backhaul-manager.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/B3hnamR/BackhaulManager/master/backhaul-manager.sh -o /tmp/backhaul-manager.sh && sudo install -m 700 /tmp/backhaul-manager.sh /root/backhaul-manager.sh && rm -f /tmp/backhaul-manager.sh && sudo /root/backhaul-manager.sh
 ```
 
-The command downloads the current script from this repository and opens the interactive manager. Review the script before piping it to `bash` if your server policy requires it.
+The command downloads the current script, installs it as `/root/backhaul-manager.sh`, and opens the interactive manager. This file-based installation is required for Metrics and Watchdog timers; do not pipe the script directly to `bash`.
 
 ### Manual Installation
 
@@ -83,13 +83,24 @@ The watchdog is local to each server. In **peer mode**, a tunnel needs at least 
 
 For a client-side tunnel, Safe Restart waits for an established Backhaul connection. For a server-side tunnel, it verifies that the listening port returns after the restart. Avoid restarting both ends of a tunnel at the same time.
 
+### Recommended Iran/Kharej Settings
+
+| Setting | Iran (Server) | Kharej (Client) |
+| --- | --- | --- |
+| Scheduled Restart | Keep disabled. Restarting Iran stops the listener and can affect every connected client. | Enable here if a timed reconnect is needed. |
+| Health Watchdog | Optional, for server-side service and listener monitoring. | Recommended, especially when a timed restart or automatic recovery is required. |
+| Telegram configuration | Recommended for complete server monitoring; use the same bot and chat as Kharej. | Recommended; use the same bot and chat as Iran. |
+| Telegram watchdog alerts | Optional; enables notifications about Iran-side failures and recovery. | Recommended; enables notifications for client-side failures and recovery. |
+
+Do not configure the same scheduled restart interval on both ends of one tunnel. Restarting the Kharej client first is the safer recovery path because the Iran listener stays available for reconnection.
+
 ## Pair Verification
 
 Use **Pair Tools** to export a manifest on Iran and verify it on Kharej. The manifest compares the endpoint, transport, port, relevant shared tuning values, and a SHA-256 fingerprint of the token. The original token is never written into the manifest.
 
 ## Telegram Alerts
 
-Open **Telegram Notifications** in the main menu to configure a bot token and chat ID (or channel handle), send a test message, disable alerts, or remove the configuration. Alerts are sent only when both global notifications and the tunnel watchdog's alert setting are enabled.
+Open **Telegram Notifications** in the main menu to configure a bot token and chat ID (or channel handle), send a test message, disable alerts, or remove the configuration. For complete monitoring, configure the same bot token and chat on both Iran and Kharej; for minimal alert volume, configure Kharej only. Alerts are sent only when both global notifications and the tunnel watchdog's alert setting are enabled.
 
 ## Files and Data
 

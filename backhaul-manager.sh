@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  Backhaul Free - Tunnel Manager
-#  Version : 1.3.0
+#  Version : 1.3.1
 #  Author  : @B3hnamR
 #  Supports: TCP | TCPMUX | WSMUX | WSSMUX
 #  Roles   : Iran (Server) | Kharej (Client)
@@ -37,7 +37,12 @@ HEALTH_DIR="$INSTALL_DIR/health"
 PAIR_DIR="$INSTALL_DIR/pairs"
 NOTIFY_FILE="$INSTALL_DIR/telegram-notify.conf"
 MANAGER_RUNTIME="$INSTALL_DIR/backhaul-manager-runtime.sh"
-SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
+if [[ -n "$SCRIPT_SOURCE" && -f "$SCRIPT_SOURCE" ]]; then
+    SCRIPT_PATH=$(readlink -f "$SCRIPT_SOURCE" 2>/dev/null || printf '%s' "$SCRIPT_SOURCE")
+else
+    SCRIPT_PATH=""
+fi
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 die()        { echo -e "${FAIL} ${LRED}$*${NC}" >&2; exit 1; }
@@ -373,7 +378,10 @@ watchdog_timer_name() { printf '%s-watchdog.timer' "$(tunnel_base_name "$1")"; }
 
 install_manager_runtime() {
     mkdir -p "$INSTALL_DIR"
-    [[ -f "$SCRIPT_PATH" ]] || { warn "Manager script not found: $SCRIPT_PATH"; return 1; }
+    [[ -n "$SCRIPT_PATH" && -f "$SCRIPT_PATH" ]] || {
+        warn "Manager script must be run from a file to enable timers. Download it first, then run it with bash."
+        return 1
+    }
     [[ "$SCRIPT_PATH" == "$MANAGER_RUNTIME" ]] || cp "$SCRIPT_PATH" "$MANAGER_RUNTIME" || return 1
     chmod 700 "$MANAGER_RUNTIME"
 }
@@ -1259,7 +1267,7 @@ LOGO
 ask_server_role() {
     clear
     _print_logo
-    echo -e "  ${DIM}Backhaul Free Tunnel Manager v1.3.0 by ${NC}${CYAN}@B3hnamR${NC}"
+    echo -e "  ${DIM}Backhaul Free Tunnel Manager v1.3.1 by ${NC}${CYAN}@B3hnamR${NC}"
     echo -e "  ${DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
     # Try auto-detect first
@@ -1309,7 +1317,7 @@ print_header() {
     esac
 
     _print_logo
-    echo -e "  ${DIM}Backhaul Free Tunnel Manager v1.3.0 by ${NC}${CYAN}@B3hnamR${NC}"
+    echo -e "  ${DIM}Backhaul Free Tunnel Manager v1.3.1 by ${NC}${CYAN}@B3hnamR${NC}"
     echo -e "  ${DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "  ${GRAY}IP   : ${WHITE}$ip${NC}   ${GRAY}Role : ${role_color}${BOLD}$role_label${NC}"
     [[ -x "$BINARY" ]] && {
@@ -3090,7 +3098,7 @@ main_menu() {
 
 # ─── Entry Point ─────────────────────────────────────────────────────────────
 # Keep functions sourceable for non-interactive validation without launching the UI.
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
     case "${1:-}" in
         --watchdog)
             [[ $# -eq 2 ]] || die "Usage: $0 --watchdog <service>"
